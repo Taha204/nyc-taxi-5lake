@@ -154,36 +154,112 @@ Les quatre analyses SQL préparées portent sur :
 3. La répartition des courses par heure de prise en charge.
 4. La comparaison semaine / week-end.
 
-Pour l’intégration finale, les analyses au niveau course utilisent `silver_trips_pipeline` et les indicateurs quotidiens utilisent `gold_daily_stats`. Vérifier les exports finaux : la première version du notebook analytique utilisait encore `silver_trips`.
+Le [notebook analytique exporté](notebooks/03_Analytics%2C%20BI_et_Machine%20Learning.ipynb) interroge `workspace.5lake_lab.silver_trips`. Les résultats ci-dessous proviennent de ses sorties enregistrées ; ils ne constituent pas une validation des mêmes requêtes sur `silver_trips_pipeline`. Pour l’intégration au pipeline, les analyses au niveau course doivent être alignées sur `silver_trips_pipeline` et les indicateurs quotidiens sur `gold_daily_stats`.
+
+| Analyse | Résultat enregistré |
+|---|---|
+| Jour le plus chargé | 11 février 2016 : 456 courses |
+| Distance et pourboire | Tranches définies par `FLOOR(trip_distance)` ; moyenne synthétique de 15,04 % entre 0 et 1 mile et de 14,93 % entre 1 et 2 miles |
+| Répartition horaire | Maximum à 18 h avec 1 450 courses ; minimum à 5 h avec 218 courses |
+| Semaine / week-end | 15 435 courses en semaine, contre 6 412 le week-end ; distance moyenne de 2,86 miles dans les deux groupes ; pourboire moyen synthétique de 15,06 % et 15,08 % respectivement |
+
+Ces volumes semaine / week-end sont des totaux sur la période, sans normalisation par nombre de jours. Les variations des pourboires synthétiques ne permettent pas de conclure à un comportement réel des clients.
 
 ### Dashboard AI/BI
 
 | Élément demandé | Configuration finale |
 |---|---|
-| Visualisation 1 | `[À compléter : titre, type et indicateur]` |
-| Visualisation 2 | `[À compléter : titre, type et indicateur]` |
-| Visualisation 3 | `[À compléter : titre, type et indicateur]` |
-| Filtre | `[À compléter : champ et portée du filtre]` |
+| Visualisation 1 | **Courses par jour** — diagramme en barres ; nombre d’enregistrements par date (`jour`) |
+| Visualisation 2 | **Courses par heure** — diagramme en barres ; nombre d’enregistrements par heure de prise en charge (`heure`) |
+| Visualisation 3 | **Pourboire selon distance** — courbe ; moyenne de `tip_pct` par valeur de `trip_distance` |
+| Filtre | Sélecteur `jour` dans **Global filters**, affiché sur `All` ; les associations aux jeux de données et l’effet sur chaque graphique restent à vérifier dans l’éditeur |
 
-![Dashboard analytique et filtre](screenshots/05_dashboard.png)
+Le dashboard présente dans sa capture actualisée le titre **TABLEAU DE BORD — Taxi Analytics**, ainsi que les trois visualisations et le sélecteur de date ci-dessous. La courbe par distance utilise les distances affichées, tandis que le notebook SQL regroupe par miles entiers : les deux niveaux d’agrégation sont distincts. La capture seule ne permet pas de vérifier la table source ni la propagation du filtre.
+
+![Dashboard TP_5LAKE_Analytics_NYC_Taxi : courses par jour, courses par heure, pourboire selon la distance et filtre jour](screenshots/05_dashboard.png)
+
+[Ouvrir la capture du dashboard en taille réelle](screenshots/05_dashboard.png)
 
 
-### Question 3 — Exactitude et ambiguïtés des réponses Genie
+### Question 3 — Analyse conversationnelle avec Databricks Genie
 
-Compléter ce tableau à partir des trois questions réellement posées et du SQL généré, sans déduire la justesse de la seule réponse textuelle.
+Nous avons configuré un agent Databricks Genie nommé **Taxi Trip Performance Analytics** pour interroger les courses NYC en langage naturel. Il utilise notamment `workspace.5lake_lab.silver_trips_pipeline`, produite par le pipeline Lakeflow.
 
-| Question posée | Vérification SQL et résultat | Conclusion |
-|---|---|---|
-| `[À compléter : question 1]` | `[Table, agrégation, filtres, résultat comparé]` | `[Correct / erreur / ambiguïté]` |
-| `[À compléter : question 2]` | `[Table, agrégation, filtres, résultat comparé]` | `[Correct / erreur / ambiguïté]` |
-| `[À compléter : question 3]` | `[Table, agrégation, filtres, résultat comparé]` | `[Correct / erreur / ambiguïté]` |
+#### Test 1 — Nombre total de courses
 
-**Ambiguïté à vérifier, et non erreur déjà observée :** « pourboire moyen » peut désigner un montant en USD ou un pourcentage. De même, le chiffre d’affaires doit être défini ici comme la somme de `fare_amount`, hors pourboires. Les commentaires de colonnes et les instructions de l’espace Genie doivent préciser ces conventions, le sens de `tip_pct` et le caractère synthétique des données.
+**Question posée :** « Combien de courses contient la table `silver_trips_pipeline` ? »
 
-**Réponse finale à compléter :** `[Indiquer si les réponses étaient correctes, décrire un cas effectivement observé et la correction apportée aux commentaires ou instructions.]`
+Requête SQL de référence :
 
-**Capture complémentaire — Question Genie et SQL contrôlé**  
-_Insérer ici la capture : `screenshots/06_genie_sql.png`._
+```sql
+SELECT COUNT(*) AS total_courses
+FROM workspace.`5lake_lab`.silver_trips_pipeline;
+```
+
+Le résultat exact fourni par Genie reste à confirmer par comparaison avec ce `COUNT(*)`. Les **21 847 prédictions** observées dans `gold_predictions` correspondent aux lignes utilisées pour le scoring ; ce comptage Gold ne remplace pas le contrôle de la table Silver.
+
+#### Test 2 — Les dix jours les plus chargés
+
+**Question posée :** « Quels sont les 10 jours avec le plus grand nombre de courses dans `silver_trips_pipeline` ? »
+
+| Date | Nombre de courses rapporté |
+|---|---:|
+| 11 février 2016 | 456 |
+| 30 janvier 2016 | 451 |
+| 26 février 2016 | 450 |
+| 21 janvier 2016 | 440 |
+| 13 février 2016 | 438 |
+| 6 février 2016 | 436 |
+| 12 février 2016 | 428 |
+| 18 février 2016 | 420 |
+| 22 janvier 2016 | 417 |
+| 16 janvier 2016 | 415 |
+
+Genie a identifié le **11 février 2016**, avec **456 courses**, comme journée la plus chargée. Les dix résultats rapportés correspondent à ceux du notebook SQL exporté sur `silver_trips`. La validation sur `silver_trips_pipeline` nécessite encore de contrôler le SQL généré et de rejouer la requête de référence sur cette même table.
+
+#### Test 3 — Pourboire moyen en semaine et le week-end
+
+**Question posée :** « Quel est le pourcentage moyen de pourboire en semaine et le week-end dans `silver_trips_pipeline` ? »
+
+| Période | Pourcentage moyen rapporté par Genie |
+|---|---:|
+| Semaine | 15,06 % |
+| Week-end | 15,20 % |
+
+Avec les valeurs affichées arrondies, l’écart est de **0,14 point de pourcentage**. Le notebook analytique exporté sur `silver_trips` affiche **15,08 %** le week-end, contre **15,20 %** dans la réponse Genie rapportée sur `silver_trips_pipeline`. Les deux tables utilisent des pourboires synthétiques calculés différemment : cette différence ne suffit donc pas à établir une erreur de Genie, ni à valider sa réponse. Il faut comparer sur la même table et avec les mêmes règles.
+
+Requête de référence pour ce contrôle :
+
+```sql
+SELECT
+    CASE
+        WHEN DAYOFWEEK(tpep_pickup_datetime) IN (1, 7)
+            THEN 'Week-end'
+        ELSE 'Semaine'
+    END AS periode,
+    COUNT(*) AS nombre_courses,
+    ROUND(AVG(tip_pct), 2) AS pourboire_moyen_pct
+FROM workspace.`5lake_lab`.silver_trips_pipeline
+GROUP BY 1;
+```
+
+#### Erreur rencontrée et correction
+
+Lors de la première configuration, Genie indiquait que `silver_trips_pipeline` n’existait pas alors qu’elle était présente dans Unity Catalog. La table n’avait pas encore été ajoutée aux sources accessibles à l’agent.
+
+La correction a consisté à ouvrir **Configure → Sources**, ajouter `workspace.5lake_lab.silver_trips_pipeline`, enregistrer la configuration puis relancer les questions. Après cet ajout, Genie a reconnu la table et fourni les réponses rapportées ci-dessus.
+
+#### Bilan de vérification
+
+| Test | État de validation |
+|---|---|
+| Nombre total de courses | Réponse Genie et comparaison avec le comptage Silver à confirmer |
+| Dix jours les plus chargés | Concordance avec le notebook sur `silver_trips` ; SQL généré et contrôle sur la table pipeline à vérifier |
+| Semaine / week-end | Valeurs rapportées documentées ; comparaison SQL sur la même table à effectuer |
+
+Genie permet d’explorer les données en langage naturel. La configuration des sources, les permissions et la précision des questions conditionnent les réponses. « Pourboire moyen » doit préciser s’il s’agit d’un montant ou d’un pourcentage ; ici `tip_pct` est exprimé en pourcentage et reste **synthétique**. Les résultats et le SQL généré doivent être vérifiés avant toute interprétation métier.
+
+**Preuve complémentaire à ajouter :** capture d’une question Genie et de son SQL généré (`screenshots/06_genie_sql.png`).
 
 ## 8. Machine Learning, MLflow et scoring — partie 6
 
@@ -204,10 +280,14 @@ Les paramètres, les métriques et le modèle sont enregistrés avec MLflow. Une
 
 | Résultat d’évaluation sur le jeu de test | Valeur à relever dans MLflow |
 |---|---|
-| RMSE, en points de pourcentage | `[À compléter]` |
-| R² | `[À compléter]` |
-| Run MLflow retenu | `[À compléter : nom ou identifiant du run final]` |
-| Nombre de prédictions enregistrées | `[À compléter avec SELECT COUNT(*)]` |
+| RMSE, en points de pourcentage | **8,6396** |
+| R² | **−0,0087** |
+| Run MLflow retenu | `RandomForest_Tip_Prediction` — `8cfe9d53c6c6412d8393df7e6b61a7fb` |
+| Nombre de prédictions enregistrées | **21 847**, confirmé par `SELECT COUNT(*)` dans le notebook ML exporté |
+
+Ces résultats proviennent des sorties enregistrées du [notebook Machine Learning / MLflow](notebooks/04_Machine_Learning_MLflow.ipynb), entraîné sur `silver_trips_pipeline` après suppression des valeurs manquantes, soit **21 847 lignes** avant découpage. Le RMSE correspond à une erreur quadratique moyenne d’environ **8,64 points de pourcentage**. Le R² légèrement négatif indique une performance inférieure à une prédiction constante égale à la moyenne de la cible du jeu de test, selon la définition de cette métrique. Ce résultat est cohérent avec une cible synthétique et ne démontre aucune capacité prédictive métier.
+
+L’artefact retenu est `runs:/8cfe9d53c6c6412d8393df7e6b61a7fb/random_forest_tip_model_v2`, enregistré comme **version 1** dans Unity Catalog. Le suffixe `v2` désigne ici l’artefact à signature explicite corrigée, et non une version 2 du registre. Le [notebook de scoring du Job](notebooks/03_scoring_job.ipynb) recharge cette version sans réentraînement et remplace la table Gold à chaque exécution. Le nombre de prédictions ci-dessus correspond à l’exécution exportée, pas à une nouvelle exécution réalisée pour ce README.
 
 Le découpage aléatoire convient à la démonstration. Pour évaluer une utilisation future, un découpage temporel serait préférable. La cible synthétique ne permet pas de conclure à une relation réelle entre caractéristiques des courses et pourboires.
 
@@ -267,7 +347,7 @@ Enfin, l’évaluation temporelle, la dérive des données et les métriques du 
 | `notebooks/01_Data_Engineering.ipynb` | Travail de Félix : parties 1 et 2 |
 | `notebooks/00_ingestion_job.ipynb` | Ingestion paramétrée pour le Job |
 | `notebooks/02_preparation_gouvernance.ipynb` | Vérifications et gouvernance ; adapter au nom réel |
-| `notebooks/03_Analytics_BI.ipynb` | Requêtes analytiques ; adapter au nom réel |
+| `notebooks/03_Analytics, BI_et_Machine Learning.ipynb` | Requêtes analytiques et sorties enregistrées de Karl |
 | `notebooks/04_Machine_Learning_MLflow.ipynb` | Entraînement, métriques et enregistrement |
 | `notebooks/03_scoring_job.ipynb` | Chargement du modèle et scoring batch |
 | `pipelines/02_taxi_pipeline.sql` | Définition déclarative Bronze/Silver/Gold |
@@ -278,9 +358,11 @@ Enfin, l’évaluation temporelle, la dérive des données et les métriques du 
 
 ### Contrôle final avant remise
 
-- [ ] Compléter les métriques RMSE et R² à partir du run retenu.
-- [ ] Documenter le dashboard, ses trois visualisations et son filtre.
-- [ ] Compléter la question 3 avec les trois tests Genie réellement effectués.
+- [x] Compléter les métriques RMSE et R² à partir du run retenu.
+- [x] Documenter les trois visualisations et le filtre visibles sur la capture du dashboard.
+- [ ] Vérifier les tables sources du dashboard et l’effet du filtre `jour` sur chaque graphique.
+- [x] Documenter les trois questions Genie et l’erreur de configuration rencontrée.
+- [ ] Confirmer le comptage Silver et contrôler les requêtes SQL générées par Genie, notamment la comparaison semaine / week-end.
 - [ ] Ajouter les cinq preuves obligatoires : pipeline, Job, dashboard, MLflow et lineage des prédictions.
 - [ ] Vérifier commentaires et tags sur les deux tables Gold.
 - [ ] Indiquer le statut réel de la planification quotidienne.
