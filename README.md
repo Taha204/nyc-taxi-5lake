@@ -154,18 +154,31 @@ Les quatre analyses SQL préparées portent sur :
 3. La répartition des courses par heure de prise en charge.
 4. La comparaison semaine / week-end.
 
-Pour l’intégration finale, les analyses au niveau course utilisent `silver_trips_pipeline` et les indicateurs quotidiens utilisent `gold_daily_stats`. Vérifier les exports finaux : la première version du notebook analytique utilisait encore `silver_trips`.
+Le [notebook analytique exporté](notebooks/03_Analytics%2C%20BI_et_Machine%20Learning.ipynb) interroge `workspace.5lake_lab.silver_trips`. Les résultats ci-dessous proviennent de ses sorties enregistrées ; ils ne constituent pas une validation des mêmes requêtes sur `silver_trips_pipeline`. Pour l’intégration au pipeline, les analyses au niveau course doivent être alignées sur `silver_trips_pipeline` et les indicateurs quotidiens sur `gold_daily_stats`.
+
+| Analyse | Résultat enregistré |
+|---|---|
+| Jour le plus chargé | 11 février 2016 : 456 courses |
+| Distance et pourboire | Tranches définies par `FLOOR(trip_distance)` ; moyenne synthétique de 15,04 % entre 0 et 1 mile et de 14,93 % entre 1 et 2 miles |
+| Répartition horaire | Maximum à 18 h avec 1 450 courses ; minimum à 5 h avec 218 courses |
+| Semaine / week-end | 15 435 courses en semaine, contre 6 412 le week-end ; distance moyenne de 2,86 miles dans les deux groupes ; pourboire moyen synthétique de 15,06 % et 15,08 % respectivement |
+
+Ces volumes semaine / week-end sont des totaux sur la période, sans normalisation par nombre de jours. Les variations des pourboires synthétiques ne permettent pas de conclure à un comportement réel des clients.
 
 ### Dashboard AI/BI
 
 | Élément demandé | Configuration finale |
 |---|---|
-| Visualisation 1 | `[À compléter : titre, type et indicateur]` |
-| Visualisation 2 | `[À compléter : titre, type et indicateur]` |
-| Visualisation 3 | `[À compléter : titre, type et indicateur]` |
-| Filtre | `[À compléter : champ et portée du filtre]` |
+| Visualisation 1 | **Courses par jour** — diagramme en barres ; nombre d’enregistrements par date (`jour`) |
+| Visualisation 2 | **Courses par heure** — diagramme en barres ; nombre d’enregistrements par heure de prise en charge (`heure`) |
+| Visualisation 3 | **Pourboire selon distance** — courbe ; moyenne de `tip_pct` par valeur de `trip_distance` |
+| Filtre | Sélecteur `jour` dans **Global filters**, affiché sur `All` ; les associations aux jeux de données et l’effet sur chaque graphique restent à vérifier dans l’éditeur |
 
-![Dashboard analytique et filtre](screenshots/05_dashboard.png)
+Le dashboard **TP_5LAKE_Analytics_NYC_Taxi**, page **Analyse des courses NYC**, présente les trois visualisations et le sélecteur de date ci-dessous. La courbe par distance utilise les distances affichées, tandis que le notebook SQL regroupe par miles entiers : les deux niveaux d’agrégation sont distincts. La capture seule ne permet pas de vérifier la table source ni la propagation du filtre.
+
+![Dashboard TP_5LAKE_Analytics_NYC_Taxi : courses par jour, courses par heure, pourboire selon la distance et filtre jour](screenshots/05_dashboard.png)
+
+[Ouvrir la capture du dashboard en taille réelle](screenshots/05_dashboard.png)
 
 
 ### Question 3 — Exactitude et ambiguïtés des réponses Genie
@@ -204,10 +217,14 @@ Les paramètres, les métriques et le modèle sont enregistrés avec MLflow. Une
 
 | Résultat d’évaluation sur le jeu de test | Valeur à relever dans MLflow |
 |---|---|
-| RMSE, en points de pourcentage | `[À compléter]` |
-| R² | `[À compléter]` |
-| Run MLflow retenu | `[À compléter : nom ou identifiant du run final]` |
-| Nombre de prédictions enregistrées | `[À compléter avec SELECT COUNT(*)]` |
+| RMSE, en points de pourcentage | **8,6396** |
+| R² | **−0,0087** |
+| Run MLflow retenu | `RandomForest_Tip_Prediction` — `8cfe9d53c6c6412d8393df7e6b61a7fb` |
+| Nombre de prédictions enregistrées | **21 847**, confirmé par `SELECT COUNT(*)` dans le notebook ML exporté |
+
+Ces résultats proviennent des sorties enregistrées du [notebook Machine Learning / MLflow](notebooks/04_Machine_Learning_MLflow.ipynb), entraîné sur `silver_trips_pipeline` après suppression des valeurs manquantes, soit **21 847 lignes** avant découpage. Le RMSE correspond à une erreur quadratique moyenne d’environ **8,64 points de pourcentage**. Le R² légèrement négatif indique une performance inférieure à une prédiction constante égale à la moyenne de la cible du jeu de test, selon la définition de cette métrique. Ce résultat est cohérent avec une cible synthétique et ne démontre aucune capacité prédictive métier.
+
+L’artefact retenu est `runs:/8cfe9d53c6c6412d8393df7e6b61a7fb/random_forest_tip_model_v2`, enregistré comme **version 1** dans Unity Catalog. Le suffixe `v2` désigne ici l’artefact à signature explicite corrigée, et non une version 2 du registre. Le [notebook de scoring du Job](notebooks/03_scoring_job.ipynb) recharge cette version sans réentraînement et remplace la table Gold à chaque exécution. Le nombre de prédictions ci-dessus correspond à l’exécution exportée, pas à une nouvelle exécution réalisée pour ce README.
 
 Le découpage aléatoire convient à la démonstration. Pour évaluer une utilisation future, un découpage temporel serait préférable. La cible synthétique ne permet pas de conclure à une relation réelle entre caractéristiques des courses et pourboires.
 
@@ -267,7 +284,7 @@ Enfin, l’évaluation temporelle, la dérive des données et les métriques du 
 | `notebooks/01_Data_Engineering.ipynb` | Travail de Félix : parties 1 et 2 |
 | `notebooks/00_ingestion_job.ipynb` | Ingestion paramétrée pour le Job |
 | `notebooks/02_preparation_gouvernance.ipynb` | Vérifications et gouvernance ; adapter au nom réel |
-| `notebooks/03_Analytics_BI.ipynb` | Requêtes analytiques ; adapter au nom réel |
+| `notebooks/03_Analytics, BI_et_Machine Learning.ipynb` | Requêtes analytiques et sorties enregistrées de Karl |
 | `notebooks/04_Machine_Learning_MLflow.ipynb` | Entraînement, métriques et enregistrement |
 | `notebooks/03_scoring_job.ipynb` | Chargement du modèle et scoring batch |
 | `pipelines/02_taxi_pipeline.sql` | Définition déclarative Bronze/Silver/Gold |
@@ -278,8 +295,9 @@ Enfin, l’évaluation temporelle, la dérive des données et les métriques du 
 
 ### Contrôle final avant remise
 
-- [ ] Compléter les métriques RMSE et R² à partir du run retenu.
-- [ ] Documenter le dashboard, ses trois visualisations et son filtre.
+- [x] Compléter les métriques RMSE et R² à partir du run retenu.
+- [x] Documenter les trois visualisations et le filtre visibles sur la capture du dashboard.
+- [ ] Vérifier les tables sources du dashboard et l’effet du filtre `jour` sur chaque graphique.
 - [ ] Compléter la question 3 avec les trois tests Genie réellement effectués.
 - [ ] Ajouter les cinq preuves obligatoires : pipeline, Job, dashboard, MLflow et lineage des prédictions.
 - [ ] Vérifier commentaires et tags sur les deux tables Gold.
