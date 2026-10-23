@@ -1,0 +1,288 @@
+# NYC Taxi — Pipeline de données, analytique et prédiction des pourboires
+
+**SUPINFO · 5LAKE — Data Engineering · TP Databricks**  
+**Groupe :** Félix — Taha — Karl  
+**Environnement :** Databricks Free Edition, calcul serverless, Unity Catalog
+
+
+## 1. Contexte et objectifs
+
+Dans le rôle d’une équipe de data engineers pour une société de VTC, nous avons construit une chaîne allant des courses brutes à leur analyse et à une prédiction batch du pourcentage de pourboire.
+
+Le projet couvre l’ingestion de fichiers, le stockage Delta Lake, le nettoyage, les contrôles qualité, les agrégations, l’orchestration, la BI, le Machine Learning et la gouvernance.
+
+### Répartition du travail
+
+| Membre | Responsabilités |
+|---|---|
+| Félix | Ingestion, exploration, tables Delta Bronze/Silver, MERGE et Time Travel — parties 1 et 2 |
+| Taha | Pipeline Lakeflow, expectations, Job et gouvernance — parties 3, 4 et 7 |
+| Karl | Analyses SQL, dashboard, Genie, modèle, MLflow et scoring — parties 5 et 6 |
+
+## 2. Données et limites du projet
+
+La source est `samples.nyctaxi.trips`. Le sujet demande un échantillon d’environ 300 000 lignes ; la table accessible dans notre environnement contient **21 932 lignes**. Nous utilisons toutes les lignes disponibles, sans créer de doublons pour atteindre artificiellement le volume demandé. Le paramètre d’ingestion `sample_size = 300000` constitue un plafond.
+
+| Colonne source | Type | Description |
+|---|---|---|
+| `tpep_pickup_datetime` | Timestamp | Début de la course |
+| `tpep_dropoff_datetime` | Timestamp | Fin de la course |
+| `trip_distance` | Double | Distance de la course, en miles |
+| `fare_amount` | Double | Tarif de la course, en USD |
+| `pickup_zip` | Integer | Code postal de départ |
+| `dropoff_zip` | Integer | Code postal d’arrivée |
+
+**Pourboires synthétiques.** La source ne contient pas de montant de pourboire. `tip_pct` est donc simulé entre 0 et 30, où `15` signifie 15 %. Félix utilise un tirage avec graine dans son notebook de démonstration ; le pipeline utilise une valeur reproductible issue d’un hash des caractéristiques de la course. Ces valeurs peuvent différer entre les deux tables Silver.
+
+Les analyses et le modèle intégrés au Job utilisent **`silver_trips_pipeline`**. La simulation ne représente pas un comportement réel des clients : les performances ML démontrent le fonctionnement technique de la chaîne, pas une capacité prédictive métier validée. Cette adaptation au sujet doit être signalée à l’enseignant.
+
+## 3. Architecture et objets
+
+```mermaid
+flowchart TD
+    A["samples.nyctaxi.trips"] --> B["Volume raw : fichiers Parquet"]
+    B --> C["bronze_trips_pipeline"]
+    C --> D["silver_trips_pipeline"]
+    D --> E["gold_daily_stats"]
+    E --> F["Analyses et dashboard"]
+    D --> G["Entraînement et MLflow"]
+    G --> H["Modèle Unity Catalog — version 1"]
+    D --> I["Scoring batch"]
+    H --> I
+    I --> J["gold_predictions"]
+```
+
+| Objet | Emplacement ou nom |
+|---|---|
+| Catalogue | `workspace` |
+| Schéma | `workspace.5lake_lab` |
+| Volume | `workspace.5lake_lab.raw` |
+| Fichiers bruts | `/Volumes/workspace/5lake_lab/raw/nyc_trips/` |
+| Tables de démonstration Delta | `workspace.5lake_lab.bronze_trips`, `workspace.5lake_lab.silver_trips` |
+| Sorties Bronze/Silver du pipeline | `workspace.5lake_lab.bronze_trips_pipeline`, `workspace.5lake_lab.silver_trips_pipeline` |
+| Statistiques quotidiennes | `workspace.5lake_lab.gold_daily_stats` |
+| Prédictions | `workspace.5lake_lab.gold_predictions` |
+| Modèle enregistré | `workspace.5lake_lab.random_forest_tip_model`, version `1` |
+| Pipeline / Job | `TP_5LAKE_pipeline` / `TP_5LAKE_job` |
+
+Les couches du pipeline sont matérialisées avec `CREATE OR REFRESH MATERIALIZED VIEW`. Les noms distincts évitent les conflits avec les tables Delta utilisées pour le MERGE de démonstration. Le pipeline relit les fichiers bruts : les corrections appliquées à `silver_trips` ne sont pas automatiquement propagées à `silver_trips_pipeline`.
+
+## 4. Ingestion, exploration et Delta Lake — parties 1 et 2
+
+Les courses sont exportées en Parquet dans le Volume `raw`, puis relues pour vérifier le nombre de lignes. L’exploration porte sur le schéma, les valeurs nulles et les distributions de `trip_distance` et `fare_amount`.
+
+`bronze_trips` conserve les données brutes. `silver_trips` applique la déduplication et exclut les distances ou tarifs non positifs ainsi que les courses dont la fin précède le début. La durée est calculée par différence des timestamps, divisée par 60 pour obtenir des minutes. Un pourcentage de pourboire synthétique est ajouté.
+
+Trente corrections fictives augmentant certains tarifs de 10 % sont ensuite appliquées avec un MERGE. La correspondance utilise les timestamps et les codes postaux ; l’unicité de cette clé composée est contrôlée dans le notebook. L’historique et le Time Travel permettent de comparer les états avant et après correction.
+
+### Question 1 — Que montre l’historique ? Pourquoi Delta plutôt que Parquet simple ?
+
+`DESCRIBE HISTORY` présente les versions de la table, les dates, les opérations et leurs métriques. Dans l’exécution documentée par Félix, les versions précédentes correspondent à la création ou aux reconstructions de Silver, puis la version 3 à un MERGE ; la version 2 est consultée comme état avant correction. Ces numéros dépendent des exécutions : après relance, il faut identifier les versions pertinentes dans l’historique.
+
+Delta ajoute un journal de transactions aux fichiers Parquet. Il apporte les transactions ACID, le contrôle de schéma, les mises à jour avec MERGE, l’historique et la lecture d’anciens états. Ces fonctions facilitent la correction et la traçabilité des courses. Des fichiers Parquet seuls n’offrent pas cette gestion transactionnelle. Le Time Travel reste soumis à la conservation des fichiers et du journal nécessaires.
+
+**Capture facultative — MERGE, historique et comparaison des versions**  
+_Insérer ici la capture : `screenshots/01_delta_history.png`._
+
+## 5. Pipeline déclaratif et qualité — partie 3
+
+Le pipeline batch lit les fichiers Parquet dans Bronze, reconstruit Silver puis agrège Gold. Databricks déduit l’ordre de traitement à partir des dépendances déclarées.
+
+| Expectation sur Silver | Condition | Action |
+|---|---|---|
+| `courses_valides` | Distance et tarif non nuls et > 0 ; dates présentes ; fin ≥ début | `DROP ROW` |
+| `pourcentage_valide` | `tip_pct` non nul et compris entre 0 et 30 | `FAIL UPDATE` |
+
+La déduplication intervient avant les expectations. Les lignes invalides sont soumises au contrôle, sans filtre préalable qui masquerait leurs rejets. Le contrôle du pourcentage vérifie surtout la cohérence du calcul synthétique : il ne prouve pas la qualité d’un pourboire réellement observé.
+
+### Résultats observés
+
+| Indicateur | Valeur |
+|---|---:|
+| Courses brutes | 21 932 |
+| Courses écrites dans Silver | 21 847 |
+| Courses rejetées par `courses_valides` | 85 |
+| Taux de rejet affiché | Environ 0,4 % |
+| Jours agrégés dans Gold | 60 |
+
+`gold_daily_stats` regroupe les courses selon leur date de prise en charge :
+
+| Colonne | Définition |
+|---|---|
+| `trip_date` | Date de prise en charge |
+| `trip_count` | Nombre de courses valides |
+| `avg_trip_distance` | Distance moyenne en miles |
+| `revenue_usd` | Somme de `fare_amount`, hors pourboires ; ce n’est pas nécessairement le montant total facturé |
+| `avg_tip_pct` | Moyenne des pourcentages synthétiques, non pondérée par le tarif |
+| `avg_tip_amount_usd` | Moyenne de `fare_amount × tip_pct / 100` |
+
+### Question 2 — Combien de rejets ? Quelle règle serait critique en FAIL UPDATE ?
+
+L’expectation `courses_valides` a rejeté **85 lignes**, soit environ **0,4 %** des lignes contrôlées. Les **21 847** courses restantes ont été écrites dans Silver. L’exécution a réussi avec le contrôle `pourcentage_valide` configuré en FAIL UPDATE.
+
+Passer `courses_valides` en FAIL UPDATE rendrait la chaîne sensible à la moindre course incorrecte : une violation pourrait faire échouer la mise à jour de Silver et empêcher celle de Gold. DROP ROW permet ici de poursuivre avec les données exploitables, tout en rendant les rejets visibles. En production, les rejets devraient aussi être conservés en quarantaine et surveillés.
+
+![Pipeline exécuté avec succès](screenshots/02_pipeline_graph.png)
+
+
+![Résultats des expectations Silver](screenshots/03_expectations.png)
+
+## 6. Orchestration avec Lakeflow Jobs — partie 4
+
+Le Job `TP_5LAKE_job` enchaîne trois tâches avec la condition **All succeeded** :
+
+| Ordre | Tâche | Traitement |
+|---|---|---|
+| 1 | `01_ingestion` | Notebook `00_ingestion_job`, paramètre `sample_size = 300000`, export Parquet en overwrite |
+| 2 | `02_pipeline` | Exécution de `TP_5LAKE_pipeline` |
+| 3 | `03_scoring` | Notebook `03_scoring_job`, chargement du modèle version 1 et actualisation de Gold |
+
+**Les trois tâches ont été validées avec succès.** Le Job coordonne les traitements ; le pipeline gère les transformations et les dépendances entre les couches de données. L’entraînement est réalisé séparément et n’est pas relancé par ce Job.
+
+Le scoring remplace les résultats du précédent batch pour éviter d’accumuler des doublons lors des relances. La version du modèle est enregistrée dans les prédictions.
+
+**Planification quotidienne — bonus :** `[À compléter : non configurée, ou fréquence, heure et fuseau réellement enregistrés.]`
+
+![Job avec les trois tâches réussies](screenshots/04_job_success.png)
+
+## 7. Analytique SQL, dashboard et Genie — partie 5
+
+Les quatre analyses SQL préparées portent sur :
+
+1. Les dix jours comptant le plus de courses.
+2. Le pourcentage de pourboire moyen par tranche de distance.
+3. La répartition des courses par heure de prise en charge.
+4. La comparaison semaine / week-end.
+
+Pour l’intégration finale, les analyses au niveau course utilisent `silver_trips_pipeline` et les indicateurs quotidiens utilisent `gold_daily_stats`. Vérifier les exports finaux : la première version du notebook analytique utilisait encore `silver_trips`.
+
+### Dashboard AI/BI
+
+| Élément demandé | Configuration finale |
+|---|---|
+| Visualisation 1 | `[À compléter : titre, type et indicateur]` |
+| Visualisation 2 | `[À compléter : titre, type et indicateur]` |
+| Visualisation 3 | `[À compléter : titre, type et indicateur]` |
+| Filtre | `[À compléter : champ et portée du filtre]` |
+
+![Dashboard analytique et filtre](screenshots/05_dashboard.png)
+
+
+### Question 3 — Exactitude et ambiguïtés des réponses Genie
+
+Compléter ce tableau à partir des trois questions réellement posées et du SQL généré, sans déduire la justesse de la seule réponse textuelle.
+
+| Question posée | Vérification SQL et résultat | Conclusion |
+|---|---|---|
+| `[À compléter : question 1]` | `[Table, agrégation, filtres, résultat comparé]` | `[Correct / erreur / ambiguïté]` |
+| `[À compléter : question 2]` | `[Table, agrégation, filtres, résultat comparé]` | `[Correct / erreur / ambiguïté]` |
+| `[À compléter : question 3]` | `[Table, agrégation, filtres, résultat comparé]` | `[Correct / erreur / ambiguïté]` |
+
+**Ambiguïté à vérifier, et non erreur déjà observée :** « pourboire moyen » peut désigner un montant en USD ou un pourcentage. De même, le chiffre d’affaires doit être défini ici comme la somme de `fare_amount`, hors pourboires. Les commentaires de colonnes et les instructions de l’espace Genie doivent préciser ces conventions, le sens de `tip_pct` et le caractère synthétique des données.
+
+**Réponse finale à compléter :** `[Indiquer si les réponses étaient correctes, décrire un cas effectivement observé et la correction apportée aux commentaires ou instructions.]`
+
+**Capture complémentaire — Question Genie et SQL contrôlé**  
+_Insérer ici la capture : `screenshots/06_genie_sql.png`._
+
+## 8. Machine Learning, MLflow et scoring — partie 6
+
+Le modèle est une **Random Forest de régression** intégrée à un pipeline Spark ML avec `VectorAssembler`. Il prédit `tip_pct` à partir de quatre variables : distance, durée en minutes, heure de prise en charge et jour de la semaine. Les lignes présentant des valeurs manquantes sur les variables nécessaires sont exclues.
+
+| Paramètre | Valeur du notebook ML |
+|---|---|
+| Répartition entraînement / test | 80 % / 20 % |
+| Graine | 42 |
+| Nombre d’arbres | 50 |
+| Profondeur maximale | 8 |
+| Métriques suivies | RMSE et R² |
+| Registre | Unity Catalog |
+| Modèle | `workspace.5lake_lab.random_forest_tip_model` |
+| Version utilisée par le Job | 1 |
+
+Les paramètres, les métriques et le modèle sont enregistrés avec MLflow. Une signature décrit les quatre colonnes d’entrée et la prédiction en sortie. Le notebook de scoring charge le modèle enregistré, reconstruit les variables temporelles puis écrit les prédictions dans `gold_predictions`, avec `model_version = 1`.
+
+| Résultat d’évaluation sur le jeu de test | Valeur à relever dans MLflow |
+|---|---|
+| RMSE, en points de pourcentage | `[À compléter]` |
+| R² | `[À compléter]` |
+| Run MLflow retenu | `[À compléter : nom ou identifiant du run final]` |
+| Nombre de prédictions enregistrées | `[À compléter avec SELECT COUNT(*)]` |
+
+Le découpage aléatoire convient à la démonstration. Pour évaluer une utilisation future, un découpage temporel serait préférable. La cible synthétique ne permet pas de conclure à une relation réelle entre caractéristiques des courses et pourboires.
+
+![Run MLflow et métriques du modèle](screenshots/07_mlflow_run.png)
+
+
+
+**Capture complémentaire — Modèle Unity Catalog version 1**  
+_Insérer ici la capture : `screenshots/08_registered_model.png`._
+
+## 9. Gouvernance et lineage — partie 7
+
+La description de `gold_daily_stats` précise la date d’agrégation, la définition du chiffre d’affaires et le caractère simulé des pourboires. Les tags suivants ont été appliqués :
+
+| Clé | Valeur |
+|---|---|
+| `projet` | `5LAKE` |
+| `couche` | `gold` |
+| `pourboires` | `synthetiques` |
+
+Le lineage de `gold_daily_stats` montre la chaîne Bronze → Silver → Gold. Pour la table des prédictions, la capture attendue doit être réalisée sur **`gold_predictions`**, après exécution du scoring, afin de montrer ses dépendances effectivement enregistrées.
+
+**À vérifier avant remise :** appliquer aussi les commentaires et tags à `gold_predictions`. Le compte utilisé dans le champ **Run as** du Job doit notamment disposer du droit EXECUTE sur le modèle ; les autorisations d’accès aux données et au Volume doivent également être présentes.
+
+**Capture complémentaire — Description et tags Gold**  
+![Gouvernance de gold_daily_stats : description et tags Unity Catalog](screenshots/09_gold_governance.png)
+![Lineage de la table des prédictions](screenshots/10_predictions_lineage.png)
+## 10. Reproduire l’exécution
+
+1. Importer les notebooks et le fichier SQL dans le workspace partagé.
+2. Vérifier l’accès à la source, au schéma `workspace.5lake_lab` et au Volume `raw`.
+3. Configurer `TP_5LAKE_pipeline` avec le catalogue `workspace`, le schéma `5lake_lab` et le fichier SQL exporté.
+4. Entraîner et enregistrer le modèle avec le notebook ML ; vérifier la présence de la version 1 attendue par le scoring.
+5. Accorder au compte Run as les droits nécessaires, dont EXECUTE sur le modèle.
+6. Configurer les trois tâches du Job et le paramètre `sample_size`.
+7. Lancer le Job et vérifier la réussite des trois tâches.
+8. Contrôler les tables Gold, actualiser le dashboard si nécessaire et capturer le lineage.
+
+Le notebook de Félix conserve les démonstrations MERGE et Time Travel. Le Job utilise le notebook d’ingestion séparé pour ne pas rejouer ces démonstrations à chaque lancement. Les noms de tables sont qualifiés pour éviter de dépendre du catalogue actif.
+
+## 11. Passage en production — réflexion
+
+Nous remplacerions d’abord les pourboires synthétiques par des montants réellement observés et documentés.  
+Nous conserverions les données brutes et mettrions en quarantaine les rejets pour permettre leur analyse et leur correction.  
+Des tests automatisés vérifieraient le schéma, les transformations, les règles de qualité et le comportement des relances.  
+Le code et les configurations seraient versionnés dans Git, puis déployés par CI/CD dans des environnements séparés.  
+Des alertes suivraient les échecs, les retards, les variations de volume et l’augmentation du taux de rejet.  
+Les accès seraient accordés au moindre privilège, avec une identité d’exécution dédiée et une gestion des secrets.  
+Nous surveillerions les coûts et adapterions les calculs ainsi que les rafraîchissements aux besoins réels.  
+Enfin, l’évaluation temporelle, la dérive des données et les métriques du modèle guideraient son réentraînement.
+
+## 12. Organisation conseillée du livrable
+
+| Dossier ou fichier | Contenu |
+|---|---|
+| `README.md` | Ce document, complété avec les preuves finales |
+| `notebooks/01_Data_Engineering.ipynb` | Travail de Félix : parties 1 et 2 |
+| `notebooks/00_ingestion_job.ipynb` | Ingestion paramétrée pour le Job |
+| `notebooks/02_preparation_gouvernance.ipynb` | Vérifications et gouvernance ; adapter au nom réel |
+| `notebooks/03_Analytics_BI.ipynb` | Requêtes analytiques ; adapter au nom réel |
+| `notebooks/04_Machine_Learning_MLflow.ipynb` | Entraînement, métriques et enregistrement |
+| `notebooks/03_scoring_job.ipynb` | Chargement du modèle et scoring batch |
+| `pipelines/02_taxi_pipeline.sql` | Définition déclarative Bronze/Silver/Gold |
+| `jobs/TP_5LAKE_job.json` | Définition exportée du Job |
+| `screenshots/` | Captures numérotées référencées dans ce document |
+
+
+
+### Contrôle final avant remise
+
+- [ ] Compléter les métriques RMSE et R² à partir du run retenu.
+- [ ] Documenter le dashboard, ses trois visualisations et son filtre.
+- [ ] Compléter la question 3 avec les trois tests Genie réellement effectués.
+- [ ] Ajouter les cinq preuves obligatoires : pipeline, Job, dashboard, MLflow et lineage des prédictions.
+- [ ] Vérifier commentaires et tags sur les deux tables Gold.
+- [ ] Indiquer le statut réel de la planification quotidienne.
+- [ ] Exporter les notebooks, le SQL du pipeline et la définition du Job.
+- [ ] Retirer les champs à compléter et vérifier les chemins des captures.
